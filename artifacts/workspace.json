@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid28690",
+  "B": "/home/dev/feedback/uid28690",
+  "sha": "abb09ce5cafd45a72bbf3f976cedb64c9e5e48d8",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "cocagne",
+    "repo": "pysrp",
+    "sha": "abb09ce5cafd45a72bbf3f976cedb64c9e5e48d8"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "pysrp",
+    "cloneUrl": "https://github.com/Rrr119/pysrp.git"
+  },
+  "at": "2026-11-19T16:23:50.078Z"
+}

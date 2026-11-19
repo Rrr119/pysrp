@@ -16,8 +16,10 @@
 import os
 import sys
 import hashlib
+import hmac
 import random
 import ctypes
+import threading
 import time
 
 
@@ -340,6 +342,10 @@ def HNxorg( hash_class, N, g ):
 def get_ngk( hash_class, ng_type, n_hex, g_hex, ctx ):
     if ng_type < NG_CUSTOM:
         n_hex, g_hex = _ng_const[ ng_type ]
+    else:
+        n_hex = n_hex.encode('ascii') if isinstance(n_hex, str) else n_hex
+        g_hex = g_hex.encode('ascii') if isinstance(g_hex, str) else g_hex
+        validate_group_params( int(n_hex, 16), int(g_hex, 16) )
     N = BN_new()
     g = BN_new()
     k = BN_new()
@@ -351,6 +357,59 @@ def get_ngk( hash_class, ng_type, n_hex, g_hex, ctx ):
         BN_mod(k, k, N, ctx)
 
     return N, g, k
+
+
+def validate_group_params( N, g, min_bits=512 ):
+    if not isinstance(N, int) or not isinstance(g, int):
+        raise ValueError("Custom group parameters N and g must be integers")
+    if N.bit_length() < min_bits:
+        raise ValueError("Custom group parameter N must be at least %d bits" % min_bits)
+    if N % 2 == 0:
+        raise ValueError("Custom group parameter N must be odd (a large safe prime)")
+    if not 2 <= g <= N - 2:
+        raise ValueError("Custom group parameter g must satisfy 2 <= g <= N-2")
+
+
+def _constant_time_eq( a, b ):
+    if isinstance(a, bytes) and isinstance(b, bytes):
+        return hmac.compare_digest( a, b )
+    return a == b
+
+
+class ReplayCache:
+    """
+    Thread-safe cache of previously seen client proofs (M1 values) used
+    to reject replayed authentication attempts. Entries expire after
+    ttl_seconds so the cache does not grow without bound.
+    """
+    def __init__(self, ttl_seconds=300, max_entries=100000):
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        if max_entries <= 0:
+            raise ValueError("max_entries must be positive")
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self._entries  = dict()
+        self._lock     = threading.Lock()
+
+    def _purge(self, now):
+        expired = [ k for k, exp in self._entries.items() if exp <= now ]
+        for k in expired:
+            del self._entries[k]
+
+    # Returns True if the proof is new (and records it), False if it was
+    # already seen (i.e. a replay).
+    def check_and_add(self, proof):
+        now = time.time()
+        with self._lock:
+            self._purge( now )
+            if proof in self._entries:
+                return False
+            if len(self._entries) >= self.max_entries:
+                oldest = min( self._entries, key=self._entries.get )
+                del self._entries[oldest]
+            self._entries[proof] = now + self.ttl_seconds
+            return True
 
 
 
@@ -387,7 +446,7 @@ def create_salted_verification_key( username, password, hash_alg=SHA1, ng_type=N
 
 
 class Verifier:
-    def __init__(self,  username, bytes_s, bytes_v, bytes_A=None, hash_alg=SHA1, ng_type=NG_2048, n_hex=None, g_hex=None, bytes_b=None, k_hex=None):
+    def __init__(self,  username, bytes_s, bytes_v, bytes_A=None, hash_alg=SHA1, ng_type=NG_2048, n_hex=None, g_hex=None, bytes_b=None, k_hex=None, replay_cache=None):
         if ng_type == NG_CUSTOM and (n_hex is None or g_hex is None):
             raise ValueError("Both n_hex and g_hex are required when ng_type = NG_CUSTOM")
         if bytes_b and len(bytes_b) != 32:
@@ -409,9 +468,16 @@ class Verifier:
 
         self.safety_failed = False
 
+        # Verifiers are single-use: a client proof (M1) may be verified at
+        # most once per Verifier instance.
+        self._verify_attempted = False
+        self._replay_cache     = replay_cache
+
         hash_class = _hash_map[ hash_alg ]
         N,g,k      = get_ngk( hash_class, ng_type, n_hex, g_hex, self.ctx )
         if k_hex is not None:
+            if isinstance(k_hex, str):
+                k_hex = k_hex.encode('ascii')
             BN_hex2bn(k, k_hex)
 
         self.hash_class = hash_class
@@ -480,16 +546,36 @@ class Verifier:
             return (bn_to_bytes(self.s), bn_to_bytes(self.B))
 
 
+    # returns H_AMK on success, None on failure. Single-use: subsequent
+    # calls always return None so that captured proofs cannot be replayed.
     def verify_session(self, user_M, bytes_A=None):
+        if self._verify_attempted:
+            return None
+        self._verify_attempted = True
         if bytes_A:
             self._set_A(bytes_A)
         if not hasattr(self, 'A'):
             raise ValueError("bytes_A must be provided through Verifier constructor or verify_session parameter.")
-        if not self.safety_failed:
-            self._derive_H_AMK()
-            if user_M == self.M:
-                self._authenticated = True
-                return self.H_AMK
+        if self.safety_failed or user_M is None:
+            return None
+        if not self._register_proof(user_M):
+            return None
+        self._derive_H_AMK()
+        if _constant_time_eq(user_M, self.M):
+            self._authenticated = True
+            return self.H_AMK
+
+
+    def _register_proof(self, user_M):
+        cache = self._replay_cache
+        if cache is None:
+            return True
+        if hasattr(cache, 'check_and_add'):
+            return cache.check_and_add(user_M)
+        if user_M in cache:
+            return False
+        cache.add(user_M)
+        return True
 
 
     def _set_A(self, bytes_A):
@@ -544,6 +630,8 @@ class User:
         hash_class = _hash_map[ hash_alg ]
         N,g,k      = get_ngk( hash_class, ng_type, n_hex, g_hex, self.ctx )
         if k_hex is not None:
+            if isinstance(k_hex, str):
+                k_hex = k_hex.encode('ascii')
             BN_hex2bn(k, k_hex)
 
         self.hash_class = hash_class
@@ -646,7 +734,9 @@ class User:
 
 
     def verify_session(self, host_HAMK):
-        if self.H_AMK == host_HAMK:
+        if self.H_AMK is None or host_HAMK is None:
+            return
+        if _constant_time_eq(self.H_AMK, host_HAMK):
             self._authenticated = True
 
 

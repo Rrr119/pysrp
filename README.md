@@ -93,6 +93,54 @@ assert usr.authenticated()
 assert svr.authenticated()
 ```
 
+Custom Group Parameters (SRP-6a)
+--------------------------------
+
+SSO and other integrations that mandate specific SRP-6a group parameters
+can supply their own prime modulus `N` and generator `g` (hex-encoded) via
+`srp.NG_CUSTOM`. Custom parameters are validated on use: `N` must be an odd
+integer of at least 512 bits and `g` must satisfy `2 <= g <= N-2`.
+
+```python
+n_hex = 'AC6BDB41324A9A9BF166DE5E1389582FAF72B6651987EE07FC3192943DB56050A37329CBB4...'
+g_hex = '2'
+
+salt, vkey = srp.create_salted_verification_key( 'testuser', 'testpassword',
+                                                 ng_type=srp.NG_CUSTOM,
+                                                 n_hex=n_hex, g_hex=g_hex )
+usr = srp.User( 'testuser', 'testpassword', ng_type=srp.NG_CUSTOM,
+                n_hex=n_hex, g_hex=g_hex )
+# ... same handshake as above; pass ng_type/n_hex/g_hex to srp.Verifier as well
+```
+
+Proof Verification & Replay Protection
+--------------------------------------
+
+The protocol proofs are verified on both sides: the server verifies the
+client's proof `M1` in `Verifier.verify_session()` before releasing its own
+proof `M2` (`H_AMK`), and the client verifies `M2` in `User.verify_session()`.
+All proof comparisons are performed in constant time, and a `User` that has
+not yet processed a challenge can never be marked authenticated.
+
+To prevent replayed proofs from being accepted:
+
+* `Verifier` instances are single-use. `verify_session()` may be called at
+  most once per instance; create a fresh `Verifier` for every authentication
+  attempt.
+* For protection across restarts or worker processes, pass a shared
+  `srp.ReplayCache` (or any `set`-like object) as `replay_cache`. Already
+  seen client proofs are rejected. `ReplayCache` entries expire after
+  `ttl_seconds` (default 300).
+
+```python
+cache = srp.ReplayCache( ttl_seconds=300 )
+
+svr = srp.Verifier( uname, salt, vkey, A, replay_cache=cache )
+```
+
+The `srp/test_rfc5054.py` test cross-checks both backends against the
+official SRP-6a test vectors from RFC 5054 Appendix B.
+
 Installation
 ------------
 

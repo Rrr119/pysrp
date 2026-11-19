@@ -14,6 +14,8 @@ if not _mod:
 User                           = _mod.User
 Verifier                       = _mod.Verifier
 create_salted_verification_key = _mod.create_salted_verification_key
+ReplayCache                    = _mod.ReplayCache
+validate_group_params          = _mod.validate_group_params
 
 SHA1      = _mod.SHA1
 SHA224    = _mod.SHA224
